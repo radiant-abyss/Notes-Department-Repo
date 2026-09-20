@@ -1,0 +1,8 @@
+{
+  "ws_url": "ws://127.0.0.1:3001",
+  "department_group_id": "请填写笔记部工作群群号",
+  "onebot_token": "请填写与 NapCat 一致的 Token",
+  "owner_qq": "请填写你的QQ号",
+  "owner_name": "请填写负责人姓名",
+  "auto_approve_group_members": true
+}
