@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+notes_department.db
+notes_department.db-shm
+notes_department.db-wal
+config.json

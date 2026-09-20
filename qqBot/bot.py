@@ -5,6 +5,8 @@ import csv
 import inspect
 import json
 import re
+import subprocess
+import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta
@@ -111,6 +113,14 @@ def load_config() -> dict:
     data["owner_qq"] = str(data["owner_qq"])
     # OneBot Token 为可选项：留空可兼容旧配置；正式使用建议启用。
     data["onebot_token"] = str(data.get("onebot_token", "")).strip()
+
+    # NapCat watchdog：仅负责“WebSocket 连续失败时尝试拉起 NapCat”。
+    # 默认关闭，避免旧配置在没有 restart_napcat.bat 时意外触发。
+    data["napcat_watchdog_enabled"] = bool(data.get("napcat_watchdog_enabled", False))
+    data["napcat_restart_after_failures"] = max(1, int(data.get("napcat_restart_after_failures", 5)))
+    data["napcat_restart_cooldown_seconds"] = max(0, int(data.get("napcat_restart_cooldown_seconds", 300)))
+    data["napcat_restart_wait_seconds"] = max(0, int(data.get("napcat_restart_wait_seconds", 20)))
+    data["napcat_restart_script"] = str(data.get("napcat_restart_script", "restart_napcat.bat")).strip() or "restart_napcat.bat"
     return data
 
 
@@ -123,12 +133,39 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+# 这些命令允许“命令参数”之间省略空格。
+# 例如：认领6 / 认领 6、提交12 / 提交 12。
+# 多参数命令只允许省略“命令”和第一个参数之间的空格，
+# 例如：通过6 张三、打回6 张三 原因。
+CONCAT_ARG_COMMANDS = tuple(sorted({
+    "撤回提交", "取消认领", "重新开放", "修改任务", "删除任务", "恢复任务",
+    "移除认领", "成员统计", "管理员添加", "管理员移除", "成员移除", "成员恢复",
+    "操作日志", "认领", "提交", "完成", "通过", "打回", "重开", "注册", "任务",
+}, key=len, reverse=True))
+
+
 def split_command(text: str):
     text = clean_text(text)
     if not text:
         return "", ""
-    parts = text.split(" ", 1)
-    return parts[0], parts[1].strip() if len(parts) > 1 else ""
+
+    # 先识别“命令紧贴第一个参数”的写法。按最长命令优先，避免
+    # “撤回提交12”之类被较短命令错误识别。
+    # 如果命令后本来就是空格，则交给下面的传统解析。
+    for command in CONCAT_ARG_COMMANDS:
+        if (
+            text.startswith(command)
+            and len(text) > len(command)
+            and not text[len(command)].isspace()
+        ):
+            return command, text[len(command):].strip()
+
+    # 原有带空格写法保持兼容。
+    if " " in text:
+        parts = text.split(" ", 1)
+        return parts[0], parts[1].strip()
+
+    return text, ""
 
 
 def is_admin(user) -> bool:
@@ -269,13 +306,87 @@ def event_at_bot(event: dict) -> bool:
 
 
 class OneBotClient:
-    def __init__(self, ws_url: str, handler, access_token: str = ""):
+    def __init__(
+        self,
+        ws_url: str,
+        handler,
+        access_token: str = "",
+        *,
+        watchdog_enabled: bool = False,
+        restart_after_failures: int = 5,
+        restart_cooldown_seconds: int = 300,
+        restart_wait_seconds: int = 20,
+        restart_script: str = "restart_napcat.bat",
+    ):
         self.ws_url = ws_url
         self.handler = handler
         self.access_token = str(access_token or "").strip()
         self.ws = None
         self.pending: Dict[str, asyncio.Future] = {}
         self.send_lock = asyncio.Lock()
+
+        self.watchdog_enabled = bool(watchdog_enabled)
+        self.restart_after_failures = max(1, int(restart_after_failures))
+        self.restart_cooldown_seconds = max(0, int(restart_cooldown_seconds))
+        self.restart_wait_seconds = max(0, int(restart_wait_seconds))
+        script_path = Path(restart_script)
+        if not script_path.is_absolute():
+            script_path = BASE_DIR / script_path
+        self.restart_script = script_path.resolve()
+        self.consecutive_failures = 0
+        self.last_restart_monotonic: float | None = None
+        self.restart_lock = asyncio.Lock()
+
+    async def _maybe_restart_napcat(self) -> bool:
+        if not self.watchdog_enabled:
+            return False
+        if self.consecutive_failures < self.restart_after_failures:
+            return False
+
+        async with self.restart_lock:
+            now = time.monotonic()
+            if self.last_restart_monotonic is not None:
+                elapsed = now - self.last_restart_monotonic
+                if elapsed < self.restart_cooldown_seconds:
+                    remaining = int(self.restart_cooldown_seconds - elapsed)
+                    print(f"[Watchdog] 已达到连续失败阈值，但仍在冷却期（约 {remaining} 秒）。")
+                    return False
+
+            if not self.restart_script.exists():
+                print(f"[Watchdog] 找不到重启脚本：{self.restart_script}")
+                # 避免每 3 秒刷一次同样的错误。
+                self.last_restart_monotonic = now
+                return False
+
+            print(
+                f"[Watchdog] WebSocket 已连续失败 {self.consecutive_failures} 次，"
+                f"正在执行：{self.restart_script.name}"
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "cmd.exe",
+                    "/c",
+                    str(self.restart_script),
+                    cwd=str(self.restart_script.parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                code = await proc.wait()
+            except Exception as e:
+                print(f"[Watchdog] 启动重启脚本失败：{type(e).__name__}: {e}")
+                self.last_restart_monotonic = now
+                return False
+
+            self.last_restart_monotonic = time.monotonic()
+            self.consecutive_failures = 0
+            if code != 0:
+                print(f"[Watchdog] 重启脚本退出码为 {code}，请检查 restart_napcat.bat。")
+                return False
+
+            if self.restart_wait_seconds > 0:
+                print(f"[Watchdog] 已触发 NapCat 重启，等待 {self.restart_wait_seconds} 秒后继续连接...")
+                await asyncio.sleep(self.restart_wait_seconds)
+            return True
 
     def _connect_kwargs(self) -> dict:
         """构造 WebSocket 连接参数，并兼容 websockets 12~15 的请求头参数名。"""
@@ -297,18 +408,29 @@ class OneBotClient:
                 print(f"[NapCat] 正在连接 {self.ws_url} ...")
                 async with websockets.connect(self.ws_url, **self._connect_kwargs()) as ws:
                     self.ws = ws
+                    self.consecutive_failures = 0
                     print("[NapCat] OneBot WebSocket 已连接。")
                     await self.recv_loop(ws)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                self.consecutive_failures += 1
                 print(f"[NapCat] 连接中断：{type(e).__name__}: {e}")
+                if self.watchdog_enabled:
+                    print(
+                        f"[Watchdog] 当前连续失败：{self.consecutive_failures}/"
+                        f"{self.restart_after_failures}"
+                    )
             finally:
                 self.ws = None
                 for fut in self.pending.values():
                     if not fut.done():
                         fut.set_exception(ConnectionError("NapCat WebSocket 已断开"))
                 self.pending.clear()
+
+            restarted = await self._maybe_restart_napcat()
+            if restarted:
+                continue
             print("[NapCat] 3 秒后重连...")
             await asyncio.sleep(3)
 
@@ -373,10 +495,23 @@ class NotesDepartmentBot:
             self.config["ws_url"],
             self.handle_event,
             access_token=self.config.get("onebot_token", ""),
+            watchdog_enabled=self.config.get("napcat_watchdog_enabled", False),
+            restart_after_failures=self.config.get("napcat_restart_after_failures", 5),
+            restart_cooldown_seconds=self.config.get("napcat_restart_cooldown_seconds", 300),
+            restart_wait_seconds=self.config.get("napcat_restart_wait_seconds", 20),
+            restart_script=self.config.get("napcat_restart_script", "restart_napcat.bat"),
         )
         print(f"[Bot] 工作群：{self.workspace}")
         print(f"[Bot] Owner：{self.owner_name} ({self.owner_qq})")
         print("[安全] OneBot Token：" + ("已启用" if self.config.get("onebot_token") else "未启用"))
+        if self.config.get("napcat_watchdog_enabled", False):
+            print(
+                "[Watchdog] 已启用：连续失败 "
+                f"{self.config.get('napcat_restart_after_failures', 5)} 次后尝试重启 NapCat；"
+                f"冷却 {self.config.get('napcat_restart_cooldown_seconds', 300)} 秒。"
+            )
+        else:
+            print("[Watchdog] 未启用。")
         backup_task = asyncio.create_task(self.backup_loop())
         try:
             await self.client.run_forever()

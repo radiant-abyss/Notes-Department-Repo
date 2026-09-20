@@ -4,5 +4,10 @@
   "onebot_token": "请填写与 NapCat 一致的 Token",
   "owner_qq": "请填写你的QQ号",
   "owner_name": "请填写负责人姓名",
-  "auto_approve_group_members": true
+  "auto_approve_group_members": true,
+  "napcat_watchdog_enabled": true,
+  "napcat_restart_after_failures": 5,
+  "napcat_restart_cooldown_seconds": 300,
+  "napcat_restart_wait_seconds": 20,
+  "napcat_restart_script": "restart_napcat.bat"
 }

@@ -1,0 +1,15 @@
+在你现有 config.json 最后一个配置项后加入以下字段（注意前一个字段末尾要有逗号）：
+
+  "napcat_watchdog_enabled": true,
+  "napcat_restart_after_failures": 5,
+  "napcat_restart_cooldown_seconds": 300,
+  "napcat_restart_wait_seconds": 20,
+  "napcat_restart_script": "restart_napcat.bat"
+
+说明：
+- 连续 5 次 WebSocket 连接失败后，Bot 执行 restart_napcat.bat。
+- 两次自动重启之间至少间隔 300 秒。
+- 触发重启后等待 20 秒，再继续连接 127.0.0.1:3001。
+- restart_napcat.bat 已按 C:\NapCat.Shell\launcher-win10.bat 配置。
+- 默认 KILL_QQ=0，不会杀掉 QQ.exe。
+- 如果 NapCat 必须连同 QQ 一起重启才能恢复，可以把 bat 里的 KILL_QQ=0 改为 1；但这会结束所有 QQ.exe。
