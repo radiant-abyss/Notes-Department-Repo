@@ -257,7 +257,97 @@ def init_db() -> None:
 
         if backup_path:
             print(f"[数据库] 已自动迁移到 v5；迁移前备份：{backup_path.name}")
+    migrate_user_profile()
+    migrate_task_progress()
 
+
+
+def migrate_task_progress():
+    """Add per-member latest progress without changing assignment status."""
+    with connect() as conn:
+        cols = _column_names(conn, "task_assignments")
+        if not cols:
+            raise RuntimeError("任务认领表不存在，请先初始化数据库")
+        missing = [name for name in ("progress_text", "progress_updated_at") if name not in cols]
+        if not missing:
+            return None
+        backup = _backup_before_migration(conn, "progress_v7")
+        conn.execute("BEGIN IMMEDIATE")
+        cols = _column_names(conn, "task_assignments")
+        for name in missing:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE task_assignments ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        return backup
+
+
+def update_task_progress(workspace: str, task_id: int, qq: str, text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "empty"
+    if len(text) > 1000:
+        return "too_long"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM users WHERE workspace=? AND qq=? AND active=1", (workspace, str(qq))).fetchone():
+            return "inactive"
+        task = conn.execute("SELECT status, deleted_at FROM tasks WHERE workspace=? AND id=?", (workspace, task_id)).fetchone()
+        if not task:
+            return "not_found"
+        if task["deleted_at"] is not None:
+            return "deleted"
+        assignment = conn.execute("SELECT status FROM task_assignments WHERE workspace=? AND task_id=? AND qq=?", (workspace, task_id, str(qq))).fetchone()
+        if not assignment:
+            return "not_claimed"
+        if assignment["status"] == "completed" or task["status"] == "completed":
+            return "completed"
+        if assignment["status"] == "submitted":
+            return "submitted"
+        conn.execute("UPDATE task_assignments SET progress_text=?, progress_updated_at=? WHERE workspace=? AND task_id=? AND qq=? AND status='claimed'", (text, now_text(), workspace, task_id, str(qq)))
+        return "ok"
+
+
+def migrate_user_profile():
+    """Add columns without replacing member rows or task records."""
+    with connect() as conn:
+        cols = _column_names(conn, "users")
+        if not cols:
+            raise RuntimeError("成员表不存在，请先初始化数据库")
+        missing = [c for c in ("student_number", "major_college", "minor_college") if c not in cols]
+        if not missing:
+            return None
+        backup = _backup_before_migration(conn, "profile_v6")
+        conn.execute("BEGIN IMMEDIATE")
+        cols = _column_names(conn, "users")
+        for column in missing:
+            if column not in cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        return backup
+
+
+def validate_user_profile(student_number, major_college, minor_college):
+    values = [str(v).strip() if v is not None else "" for v in (student_number, major_college, minor_college)]
+    for label, value in zip(("学号", "学院（主修）", "辅修学院"), values):
+        if not value:
+            raise ValueError(f"{label}不能为空；没有辅修学院请填“无”")
+        if len(value) > 100 or any(ch in value for ch in "\r\n|｜"):
+            raise ValueError(f"{label}格式不正确，请填写不超过 100 字的单项内容")
+    if any(ch.isspace() for ch in values[0]):
+        raise ValueError("学号中不能包含空格")
+    if values[1].startswith("未来技术学院") and (not values[1].startswith("未来技术学院-") or not values[1][len("未来技术学院-"):].strip()):
+        raise ValueError("未来技术学院请填写：未来技术学院-某某学院")
+    return tuple(values)
+
+
+def update_user_profile(workspace, qq, student_number, major_college, minor_college):
+    values = validate_user_profile(student_number, major_college, minor_college)
+    with connect() as conn:
+        result = conn.execute(
+            "UPDATE users SET student_number=?, major_college=?, minor_college=? WHERE workspace=? AND qq=? AND active=1",
+            (*values, workspace, str(qq)),
+        )
+        if result.rowcount != 1:
+            raise ValueError("未找到有效成员，请先注册或联系负责人")
+    return get_user(workspace, str(qq))
 
 
 def get_user(workspace: str, qq: str, include_inactive: bool = False):
@@ -292,11 +382,14 @@ def ensure_owner(workspace: str, owner_qq: str, owner_name: str = "Owner"):
     return get_user(workspace, owner_qq)
 
 
-def register_user(workspace: str, qq: str, name: str, owner_qq: Optional[str] = None):
+def register_user(workspace: str, qq: str, name: str, owner_qq: Optional[str] = None, *, student_number=None, major_college=None, minor_college=None):
     qq = str(qq)
     name = name.strip()
     if not name:
         raise ValueError("姓名不能为空")
+    profile = None
+    if any(v is not None for v in (student_number, major_college, minor_college)):
+        profile = validate_user_profile(student_number, major_college, minor_college)
     with connect() as conn:
         row = conn.execute(
             "SELECT * FROM users WHERE workspace=? AND qq=?",
@@ -319,6 +412,8 @@ def register_user(workspace: str, qq: str, name: str, owner_qq: Optional[str] = 
                 """,
                 (workspace, qq, name, role, now_text()),
             )
+        if profile is not None:
+            conn.execute("UPDATE users SET student_number=?, major_college=?, minor_college=? WHERE workspace=? AND qq=?", (*profile, workspace, qq))
     return get_user(workspace, qq)
 
 
@@ -534,6 +629,7 @@ def _get_task_with_conn(
     assignees = conn.execute(
         """
         SELECT a.qq, a.status, a.claimed_at, a.submitted_at, a.completed_at,
+               a.progress_text, a.progress_updated_at,
                a.submission_text, a.review_comment, a.reviewed_at, a.reviewer_qq,
                COALESCE(u.name, a.qq) AS name,
                COALESCE(u.active, 0) AS user_active,
@@ -1111,7 +1207,7 @@ def member_stats(workspace: str, qq: str):
 def export_data(workspace: str):
     with connect() as conn:
         users = [dict(r) for r in conn.execute(
-            "SELECT id, qq, name, role, registered_at, active FROM users WHERE workspace=? ORDER BY id",
+            "SELECT id, qq, name, role, student_number, major_college, minor_college, registered_at, active FROM users WHERE workspace=? ORDER BY id",
             (workspace,),
         ).fetchall()]
         tasks = [dict(r) for r in conn.execute(
@@ -1125,6 +1221,7 @@ def export_data(workspace: str):
         assignments = [dict(r) for r in conn.execute(
             """
             SELECT a.id, a.task_id, a.qq, COALESCE(u.name, a.qq) AS name, a.status,
+                   a.progress_text, a.progress_updated_at,
                    a.claimed_at, a.submitted_at, a.completed_at, a.submission_text,
                    a.review_comment, a.reviewed_at, a.reviewer_qq
             FROM task_assignments a

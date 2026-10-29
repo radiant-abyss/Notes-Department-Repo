@@ -31,9 +31,43 @@ ROLE_LABEL = {
 
 PRIVATE_HELP = """笔记部 Bot（私聊）
 
-【成员】
-注册 <姓名>
-我的身份
+【新成员：先注册，再补齐资料】
+先加入笔记部工作群，然后私聊我发送：
+注册 张三
+（把“张三”换成你的姓名。）
+注册成功后发送：完善信息
+按提示依次填写：学号 → 学院（主修）→ 辅修学院。
+
+【旧成员：直接补填，不用重新注册】
+发送：完善信息
+补填或修改只更新个人资料，保留原身份、认领、提交及完成记录。
+资料未填齐不会清除或阻止现有任务操作。
+逐项填写时发送“取消”可退出；填齐三项后才保存。
+
+【填写要求与一次填完的写法】
+学号：填写完整学号，开头的 0 也要保留。
+学院（主修）：填写主修学院或学部。
+未来技术学院成员填写：未来技术学院-某某学院（或学部）。
+例如：未来技术学院-计算学部
+辅修学院：有辅修填学院名称，没有填“无”，不要留空。
+
+也可以用 | 分隔各项，一条消息填完：
+新成员格式：注册 <姓名> | <学号> | <学院（主修）> | <辅修学院>
+示例：注册 张三 | 2024111001 | 计算学部 | 无
+旧成员格式：完善信息 <学号> | <学院（主修）> | <辅修学院>
+示例：完善信息 2024111002 | 未来技术学院-计算学部 | 数学学院
+示例中的姓名和学号请换成自己的，不要输入尖括号。
+
+查看资料：我的信息（“我的身份”也可以）
+填错了：重新发送“完善信息”修改。
+
+【成员任务操作】
+我的待办          # 汇总资料缺项、进行中/需修改任务；待审核单独列出
+更新进度 <编号> <进度说明>
+例如：更新进度 12 初稿完成，还差例题
+每位成员分别保存自己的最近一次进度和更新时间，不覆盖他人。
+更新进度不等于提交，不会通知群聊；正式交付仍发送“提交 <编号>”。
+待审核期间请等待审核；确需修改，可先“撤回提交 <编号>”。
 任务
 任务 <编号>
 认领 <编号>
@@ -56,7 +90,8 @@ PRIVATE_HELP = """笔记部 Bot（私聊）
 恢复任务 <编号>
 已删除任务
 移除认领 <编号> <姓名或QQ>
-成员列表
+成员列表          # 查看成员及个人资料
+信息未齐成员      # 查看尚未填齐三项资料的成员
 管理员列表
 操作日志 [条数]
 本周统计
@@ -99,12 +134,29 @@ publish_sessions: Dict[str, PublishSession] = {}
 edit_sessions: Dict[str, EditSession] = {}
 delete_sessions: Dict[str, int] = {}
 submit_sessions: Dict[str, int] = {}
+profile_sessions: Dict[str, list[str]] = {}
+
+PROFILE_USAGE = "完善信息 <学号> | <学院（主修）> | <辅修学院>\n例如：完善信息 0012345678 | 未来技术学院-计算机学院 | 无\n没有辅修学院请填“无”。也可只发“完善信息”，按提示逐项填写。"
+PROFILE_PROMPTS = ("请输入学号（发送“取消”可退出，旧资料不会改变）：", "请输入学院（主修）。未来技术学院请填写：未来技术学院-某某学院", "请输入辅修学院，没有请填“无”：")
+
+
+def profile_summary(user):
+    return (f"学号：{user['student_number'] or '未填写'}\n"
+            f"学院（主修）：{user['major_college'] or '未填写'}\n"
+            f"辅修学院：{user['minor_college'] or '未填写'}")
+
+
+def parse_profile_fields(text, count=3):
+    fields = [part.strip() for part in text.replace("｜", "|").split("|")]
+    if len(fields) != count or not all(fields):
+        raise ValueError("请用 | 分隔各项，且每项不能为空。\n" + PROFILE_USAGE)
+    return fields
 
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         raise RuntimeError("缺少 config.json。请复制 config.example.json 为 config.json 并填写。")
-    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     required = ["ws_url", "department_group_id", "owner_qq", "owner_name"]
     missing = [k for k in required if not str(data.get(k, "")).strip()]
     if missing:
@@ -140,7 +192,7 @@ def clean_text(text: str) -> str:
 CONCAT_ARG_COMMANDS = tuple(sorted({
     "撤回提交", "取消认领", "重新开放", "修改任务", "删除任务", "恢复任务",
     "移除认领", "成员统计", "管理员添加", "管理员移除", "成员移除", "成员恢复",
-    "操作日志", "认领", "提交", "完成", "通过", "打回", "重开", "注册", "任务",
+    "操作日志", "认领", "提交", "完成", "通过", "打回", "重开", "注册", "任务", "更新进度",
 }, key=len, reverse=True))
 
 
@@ -206,7 +258,37 @@ def assignee_text(task: dict) -> str:
     return "、".join(f"{p['name']}（{label.get(p['status'], p['status'])}）" for p in people)
 
 
-def task_summary(task: dict) -> str:
+def progress_summary(assignment: dict) -> str:
+    progress = assignment.get("progress_text") or "尚未填写"
+    when = assignment.get("progress_updated_at")
+    return f"最近进度：{progress}" + (f"\n更新时间：{when}" if when else "")
+
+
+def todo_summary(user, tasks, qq: str) -> str:
+    pending, waiting = [], []
+    missing = [label for key, label in (("student_number", "学号"), ("major_college", "学院（主修）"), ("minor_college", "辅修学院")) if not user[key]]
+    if missing:
+        pending.append("个人资料待补齐：" + "、".join(missing) + "\n发送“完善信息”按提示填写。")
+    for task in tasks:
+        mine = next((p for p in task["assignees"] if p["qq"] == str(qq)), None)
+        if not mine:
+            continue
+        title = f"#{task['id']}｜{task['task_type']}｜{task['subject']}"
+        if mine["status"] == "submitted":
+            waiting.append(title + "\n等待审核，无需重复提交。\n" + progress_summary(mine))
+        elif mine["status"] == "claimed":
+            rejected = bool(mine.get("reviewer_qq") and mine.get("reviewed_at"))
+            item = title + ("\n需修改后重新提交" if rejected else "\n进行中，完成后请提交")
+            if rejected:
+                item += "\n审核意见：" + (mine.get("review_comment") or "需要继续修改")
+            pending.append(item + "\n" + progress_summary(mine))
+    sections = [f"我的待办：{len(pending)} 项待处理", "\n\n".join(pending) if pending else "目前没有需要你处理的事项。"]
+    if waiting:
+        sections.extend([f"等待审核：{len(waiting)} 项（不计入待处理）", "\n\n".join(waiting)])
+    return "\n\n".join(sections)
+
+
+def task_summary(task: dict, show_progress: bool = False) -> str:
     lines = [
         f"任务 #{task['id']}｜{task_state_label(task)}",
         f"任务类型：{task['task_type']}",
@@ -220,6 +302,8 @@ def task_summary(task: dict) -> str:
     if task.get("publisher_name"):
         lines.append(f"发布人：{task['publisher_name']}")
     lines.append(f"参与成员：{assignee_text(task)}")
+    if show_progress and task.get("assignees"):
+        lines.append("成员进度：\n" + "\n\n".join(f"{p['name']}\n{progress_summary(p)}" for p in task["assignees"]))
     if task.get("deleted_at"):
         lines.append(f"删除时间：{task['deleted_at']}")
     return "\n".join(lines)
@@ -335,6 +419,9 @@ class OneBotClient:
         self.restart_script = script_path.resolve()
         self.consecutive_failures = 0
         self.last_restart_monotonic: float | None = None
+        # 同一次故障期间最多只主动拉起一次 NapCat，避免反复弹出窗口。
+        # 只有 WebSocket 真正恢复连接后才解除。
+        self.restart_attempted_for_outage = False
         self.restart_lock = asyncio.Lock()
 
     async def _maybe_restart_napcat(self) -> bool:
@@ -342,8 +429,13 @@ class OneBotClient:
             return False
         if self.consecutive_failures < self.restart_after_failures:
             return False
+        if self.restart_attempted_for_outage:
+            return False
 
         async with self.restart_lock:
+            # double-check：并发情况下也只允许一次。
+            if self.restart_attempted_for_outage:
+                return False
             now = time.monotonic()
             if self.last_restart_monotonic is not None:
                 elapsed = now - self.last_restart_monotonic
@@ -354,10 +446,12 @@ class OneBotClient:
 
             if not self.restart_script.exists():
                 print(f"[Watchdog] 找不到重启脚本：{self.restart_script}")
-                # 避免每 3 秒刷一次同样的错误。
                 self.last_restart_monotonic = now
+                self.restart_attempted_for_outage = True
                 return False
 
+            # 从这里开始，本次故障即视为已经尝试恢复；即使脚本失败也不会反复弹窗。
+            self.restart_attempted_for_outage = True
             print(
                 f"[Watchdog] WebSocket 已连续失败 {self.consecutive_failures} 次，"
                 f"正在执行：{self.restart_script.name}"
@@ -409,6 +503,7 @@ class OneBotClient:
                 async with websockets.connect(self.ws_url, **self._connect_kwargs()) as ws:
                     self.ws = ws
                     self.consecutive_failures = 0
+                    self.restart_attempted_for_outage = False
                     print("[NapCat] OneBot WebSocket 已连接。")
                     await self.recv_loop(ws)
             except asyncio.CancelledError:
@@ -508,7 +603,8 @@ class NotesDepartmentBot:
             print(
                 "[Watchdog] 已启用：连续失败 "
                 f"{self.config.get('napcat_restart_after_failures', 5)} 次后尝试重启 NapCat；"
-                f"冷却 {self.config.get('napcat_restart_cooldown_seconds', 300)} 秒。"
+                f"冷却 {self.config.get('napcat_restart_cooldown_seconds', 300)} 秒；"
+                "同一次故障最多自动拉起一次。"
             )
         else:
             print("[Watchdog] 未启用。")
@@ -625,6 +721,27 @@ class NotesDepartmentBot:
         if qq == self.owner_qq:
             db.ensure_owner(self.workspace, self.owner_qq, self.owner_name)
 
+        if qq in profile_sessions:
+            if text == "取消":
+                profile_sessions.pop(qq, None)
+                await self.client.send_private(qq, "已取消补填，原资料和任务记录未改变。")
+                return
+            values = profile_sessions[qq]
+            candidate = values + [text]
+            probe = candidate + ["占位"] * (3 - len(candidate))
+            try:
+                db.validate_user_profile(*probe)
+                if len(candidate) == 3:
+                    updated = db.update_user_profile(self.workspace, qq, *candidate)
+                    profile_sessions.pop(qq, None)
+                    await self.client.send_private(qq, "信息已保存，已有任务记录保留。\n" + profile_summary(updated))
+                else:
+                    profile_sessions[qq] = candidate
+                    await self.client.send_private(qq, PROFILE_PROMPTS[len(candidate)])
+            except ValueError as exc:
+                await self.client.send_private(qq, str(exc) + "\n" + PROFILE_PROMPTS[len(values)])
+            return
+
         # 会话状态优先于普通命令。
         if qq in publish_sessions:
             await self.handle_publish_session(qq, text)
@@ -650,8 +767,19 @@ class NotesDepartmentBot:
             if not await self.is_group_member(qq):
                 await self.client.send_private(qq, "注册失败：你目前不在配置的笔记部工作群中。")
                 return
-            user = db.register_user(self.workspace, qq, arg, self.owner_qq)
-            await self.client.send_private(qq, f"注册成功。\n姓名：{user['name']}\n身份：{ROLE_LABEL[user['role']]}")
+            try:
+                if "|" in arg or "｜" in arg:
+                    name, student, major, minor = parse_profile_fields(arg, 4)
+                    user = db.register_user(self.workspace, qq, name, self.owner_qq, student_number=student, major_college=major, minor_college=minor)
+                else:
+                    user = db.register_user(self.workspace, qq, arg, self.owner_qq)
+            except ValueError as exc:
+                await self.client.send_private(qq, str(exc))
+                return
+            message = f"注册成功。\n姓名：{user['name']}\n身份：{ROLE_LABEL[user['role']]}\n" + profile_summary(user)
+            if any(not user[key] for key in ("student_number", "major_college", "minor_college")):
+                message += "\n请发送“完善信息”补齐资料；不用重新注册，原任务记录会保留。"
+            await self.client.send_private(qq, message)
             return
 
         user = db.get_user(self.workspace, qq)
@@ -663,8 +791,21 @@ class NotesDepartmentBot:
                 await self.client.send_private(qq, "你还没有注册。请发送：注册 <姓名>")
             return
 
-        if cmd == "我的身份":
-            await self.client.send_private(qq, f"姓名：{user['name']}\n身份：{ROLE_LABEL[user['role']]}\nQQ：{qq}")
+        if cmd == "完善信息":
+            if not arg:
+                profile_sessions[qq] = []
+                await self.client.send_private(qq, PROFILE_PROMPTS[0])
+                return
+            try:
+                updated = db.update_user_profile(self.workspace, qq, *parse_profile_fields(arg))
+            except ValueError as exc:
+                await self.client.send_private(qq, str(exc))
+                return
+            await self.client.send_private(qq, "信息已保存，已有任务记录保留。\n" + profile_summary(updated))
+            return
+
+        if cmd in {"我的身份", "我的信息"}:
+            await self.client.send_private(qq, f"姓名：{user['name']}\n身份：{ROLE_LABEL[user['role']]}\nQQ：{qq}\n" + profile_summary(user))
             return
 
         if cmd == "任务":
@@ -674,7 +815,7 @@ class NotesDepartmentBot:
                     await self.client.send_private(qq, "用法：任务 <编号>")
                     return
                 task = db.get_task(self.workspace, tid)
-                await self.client.send_private(qq, task_summary(task) if task else "没有找到这个任务。")
+                await self.client.send_private(qq, task_summary(task, show_progress=is_admin(user)) if task else "没有找到这个任务。")
             else:
                 rows = db.list_open_tasks(self.workspace)
                 if not rows:
@@ -716,6 +857,31 @@ class NotesDepartmentBot:
                 await self.client.send_private(qq, messages.get(result, "认领失败，请稍后再试。"))
             return
 
+        if cmd == "我的待办":
+            await self.client.send_private(qq, todo_summary(user, db.list_my_active_tasks(self.workspace, qq), qq))
+            return
+
+        if cmd == "更新进度":
+            parts = arg.split(maxsplit=1)
+            tid = parse_task_id(parts[0]) if parts else None
+            if tid is None or len(parts) != 2:
+                await self.client.send_private(qq, "用法：更新进度 <编号> <进度说明>\n例如：更新进度 12 初稿完成，还差例题\n仅更新自己的进行中任务；不会提交或通知群聊。")
+                return
+            result = db.update_task_progress(self.workspace, tid, qq, parts[1])
+            messages = {
+                "ok": f"任务 #{tid} 的个人进度已更新。\n{parts[1]}\n这不是正式提交；完成后请发送：提交 {tid}",
+                "empty": "进度说明不能为空。",
+                "too_long": "进度说明请控制在 1000 字以内。",
+                "inactive": "当前成员资格无效，请联系负责人。",
+                "not_found": "任务不存在。",
+                "deleted": "任务已删除，不能更新进度。",
+                "not_claimed": "你没有认领这个任务，只能更新自己的进度。",
+                "submitted": f"该任务份额正在等待审核；如需继续修改，请先发送：撤回提交 {tid}",
+                "completed": "该任务或你的任务份额已经完成，不能更新进度。",
+            }
+            await self.client.send_private(qq, messages.get(result, "更新失败，请稍后再试。"))
+            return
+
         if cmd == "我的任务":
             rows = db.list_my_active_tasks(self.workspace, qq)
             if not rows:
@@ -728,6 +894,9 @@ class NotesDepartmentBot:
                         f"人数 {task['assigned_count']}/{task['required_people']}\n"
                         f"所需知识：{task['required_knowledge']}"
                     )
+                    mine = next((p for p in task["assignees"] if p["qq"] == qq), None)
+                    if mine:
+                        chunks[-1] += "\n" + ("状态：等待审核" if mine["status"] == "submitted" else "状态：进行中") + "\n" + progress_summary(mine)
                 await self.client.send_private(qq, "\n\n".join(chunks))
             return
 
@@ -1121,14 +1290,18 @@ class NotesDepartmentBot:
                 await self.client.send_private(qq, "\n".join(lines))
             return
 
-        if cmd == "成员列表":
+        if cmd in {"成员列表", "信息未齐成员"}:
             if not is_admin(user):
                 await self.client.send_private(qq, "只有负责人和管理员可以查看成员列表。")
                 return
             rows = db.list_users(self.workspace)
+            if cmd == "信息未齐成员":
+                rows = [row for row in rows if any(not row[key] for key in ("student_number", "major_college", "minor_college"))]
+                await self.client.send_private(qq, "信息未齐成员：\n" + ("\n".join(f"{row['name']}｜QQ {row['qq']}" for row in rows) or "所有有效成员均已填写完整。"))
+                return
             lines = ["已注册成员："]
             for row in rows:
-                lines.append(f"{row['name']}｜{ROLE_LABEL[row['role']]}｜QQ {row['qq']}")
+                lines.append(f"{row['name']}｜{ROLE_LABEL[row['role']]}｜QQ {row['qq']}\n" + profile_summary(row))
             await self.client.send_private(qq, "\n".join(lines))
             return
 

@@ -5,3 +5,14 @@ notes_department.db
 notes_department.db-shm
 notes_department.db-wal
 config.json
+
+# Local data and credentials
+*.db
+*.db-*
+*.sqlite*
+backups/
+exports/
+*.dpapi
+*.log
+*.bak
+*.zip
