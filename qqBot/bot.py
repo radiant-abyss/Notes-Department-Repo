@@ -20,6 +20,7 @@ import websockets
 
 import db
 import volunteer
+from email_alert import EmailAlerts
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -92,6 +93,8 @@ def help_for(user, command="帮助"):
             text += "\n日常管理：管理帮助"
         if senior:
             text += "\n高级管理员帮助：时长帮助"
+        if user["role"] == "owner":
+            text += "\n📧 邮件告警：配置邮箱 <邮箱地址> / 邮箱状态 / 测试邮件"
         return text + ("\n全部指令：全部帮助" if admin else "")
     if command == "全部帮助" and not admin:
         return "请发送“任务帮助”“时长帮助”或“申请帮助”查看详细用法。"
@@ -696,6 +699,7 @@ class OneBotClient:
 class NotesDepartmentBot:
     def __init__(self, config: dict):
         self.config = config
+        self.email_alerts = EmailAlerts(BASE_DIR)
         self.workspace = config["department_group_id"]
         self.owner_qq = config["owner_qq"]
         self.owner_name = config["owner_name"]
@@ -729,11 +733,14 @@ class NotesDepartmentBot:
             )
         else:
             print("[Watchdog] 未启用。")
+        email_task = asyncio.create_task(self.email_alerts.monitor(self.client))
         backup_task = asyncio.create_task(self.backup_loop())
         try:
             await self.client.run_forever()
         finally:
             backup_task.cancel()
+            email_task.cancel()
+            await asyncio.gather(backup_task, email_task, return_exceptions=True)
 
     async def backup_loop(self):
         while True:
@@ -857,6 +864,24 @@ class NotesDepartmentBot:
             if cmd != "注册":
                 await self.client.send_private(qq,REGISTRATION_HELP)
                 return
+        if cmd in {"配置邮箱", "邮箱状态", "测试邮件"}:
+            if qq != self.owner_qq:
+                await self.client.send_private(qq, "邮件告警配置仅总负责人可用。")
+                return
+            if cmd == "配置邮箱":
+                try:
+                    self.email_alerts.configure_recipient(arg.strip())
+                    reply = "告警收件邮箱已保存。发送“测试邮件”验证；更换收件地址不影响 SMTP 发件配置。"
+                except ValueError as exc:
+                    reply = str(exc)
+                except OSError:
+                    reply = "邮箱配置保存失败，请检查本机文件权限。"
+            elif cmd == "邮箱状态":
+                reply = self.email_alerts.status()
+            else:
+                reply = await self.email_alerts.test()
+            await self.client.send_private(qq, reply)
+            return
         if cmd in HELP_COMMANDS:
             key = (self.workspace, qq)
             menu_sessions.pop(key, None)

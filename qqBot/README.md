@@ -265,3 +265,26 @@ python test_volunteer.py
 python test_volunteer_permissions.py
 python test_menu_delivery.py
 ```
+
+
+### 邮件掉线告警（仅总负责人配置）
+
+在运行目录建立本机专用 `email_alert.json`：
+
+```json
+{
+  "enabled": true,
+  "recipient": "owner@example.com",
+  "smtp_source": "D:/path/to/pr-watcher/config.json"
+}
+```
+
+发件服务复用所指定 JSON 中 `notify.mail` 的 `smtp`、`port`、`user`、`code`；不运行 pr-watcher，不复制授权码。端口 465 使用 TLS，其他端口要求 STARTTLS。路径必须指向已信任的本地配置。真实配置及告警状态不提交 Git。
+
+总负责人私聊可发送 `配置邮箱 name@example.com`、`邮箱状态`、`测试邮件`。管理员和高级管理员不能修改 owner 的告警地址。邮箱指令只改收件人，不能通过 QQ 设置授权码。测试邮件一分钟最多一次。
+
+Bot 每约 15 秒检查连接及 OneBot `get_status` 的 QQ 在线状态，连续异常 60 秒后告警；同一故障成功发信后不重复，发送失败最多三次、间隔至少五分钟。告警状态落盘以避免 Bot 重启重复发信，连续健康 120 秒后允许下一轮告警。异常时长从首次检查异常开始，SMTP 接受邮件不等于收件箱已送达。
+
+此监测需要 Python Bot 和电脑网络仍在运行，无法检测自己的进程退出或在整机断网时发信；也不能证明 QQ 消息实际送达。不因邮件失败重启 NapCat。修改代码后需重启 Python Bot，邮箱配置在每次检查时读取。
+
+离线验证：`python test_email_alert.py`（临时文件、模拟 SMTP，不发送邮件）。

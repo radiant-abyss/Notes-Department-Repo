@@ -20,3 +20,9 @@ exports/
 # Recovery state belongs to the running machine
 napcat_recovery_status.json
 napcat_recovery_status.json.tmp
+
+# Private email settings and alert deduplication state
+email_alert.json
+email_alert.json.tmp
+email_alert_state.json
+email_alert_state.json.tmp
