@@ -86,6 +86,7 @@ def help_for(user, command="帮助"):
         text = (f"{greeting}\n\n"
                 "1 📋 我的待办\n2 📂 我的任务\n3 📝 提交任务\n4 ✏️ 更新进度\n"
                 "5 ⏱️ 我的志愿时长\n6 👤 我的信息\n7 💡 申请任务\n\n"
+                "🔎 想领取新任务？\n发送“任务”查看可领取列表。\n例如领取任务 #12，发送“认领 12”。\n“我的任务”只查看自己已经领取的任务。\n\n"
                 + profile_hint + "\n\n📖 详细用法与完整帮助：任务帮助 / 时长帮助 / 申请帮助")
         if admin:
             text += "\n日常管理：管理帮助"
@@ -996,7 +997,7 @@ class NotesDepartmentBot:
                             f"人数 {task['assigned_count']}/{task['required_people']}\n"
                             f"所需知识：{task['required_knowledge']}"
                         )
-                    chunks.append("\n认领：认领 <编号>")
+                    chunks.append(f"\n例如查看任务 #{rows[0]['id']}：任务 {rows[0]['id']}\n认领该任务：认领 {rows[0]['id']}\n请把编号换成你想领取的任务编号。")
                     await self.client.send_private(qq, "\n\n".join(chunks))
             return
 
