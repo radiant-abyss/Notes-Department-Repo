@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix='notes-profile-') as tmp:
         assert snapshot(db.DB_PATH)==before
         await send('完善信息');await send('取消');assert '100' not in bot.profile_sessions
         await send('我的信息');assert '辅修学院：无' in b.client.messages[-1][1]
-        await send('成员列表');assert '只有' in b.client.messages[-1][1]
+        await send('成员列表');assert '仅管理者' in b.client.messages[-1][1]
         await send('注册 新成员 | 000777 | 数学学院 | 无','101')
         assert db.get_user('w','101')['student_number']=='000777'
         await send('完善信息 000888 | 数学学院 | 物理学院','101')

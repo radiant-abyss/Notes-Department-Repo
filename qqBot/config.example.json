@@ -9,5 +9,6 @@
   "napcat_restart_after_failures": 5,
   "napcat_restart_cooldown_seconds": 300,
   "napcat_restart_wait_seconds": 20,
-  "napcat_restart_script": "restart_napcat.bat"
+  "napcat_restart_script": "restart_napcat.bat",
+  "napcat_login_qq": "请填写机器人小号QQ"
 }

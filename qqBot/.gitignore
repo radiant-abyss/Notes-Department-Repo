@@ -16,3 +16,7 @@ exports/
 *.log
 *.bak
 *.zip
+
+# Recovery state belongs to the running machine
+napcat_recovery_status.json
+napcat_recovery_status.json.tmp

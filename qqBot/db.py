@@ -259,6 +259,9 @@ def init_db() -> None:
             print(f"[数据库] 已自动迁移到 v5；迁移前备份：{backup_path.name}")
     migrate_user_profile()
     migrate_task_progress()
+    migrate_task_requests()
+    import volunteer
+    volunteer.migrate(connect, _backup_before_migration)
 
 
 
@@ -434,8 +437,8 @@ def list_admins(workspace: str):
     with connect() as conn:
         return conn.execute(
             """
-            SELECT * FROM users
-            WHERE workspace=? AND active=1 AND role IN ('owner', 'admin')
+            SELECT * FROM users u
+            WHERE workspace=? AND active=1 AND (role IN ('owner', 'admin') OR EXISTS (SELECT 1 FROM volunteer_managers v WHERE v.workspace=u.workspace AND v.qq=u.qq))
             ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, id ASC
             """,
             (workspace,),
@@ -894,8 +897,15 @@ def withdraw_submission(workspace: str, task_id: int, requester_qq: str) -> str:
         return "ok"
 
 
-def approve_submission(workspace: str, task_id: int, target_qq: str, reviewer_qq: str) -> str:
+def approve_submission(workspace: str, task_id: int, target_qq: str, reviewer_qq: str, volunteer_hours=None) -> str:
+    import volunteer
+    units = None if volunteer_hours is None else volunteer.parse_hours(volunteer_hours)
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM users WHERE workspace=? AND qq=? AND active=1 AND (role IN ('owner','admin') OR EXISTS (SELECT 1 FROM volunteer_managers m WHERE m.workspace=users.workspace AND m.qq=users.qq))", (workspace, str(reviewer_qq))).fetchone():
+            raise ValueError("仅有效管理者可审核任务。")
+        if units is not None and not volunteer._admin(conn, workspace, reviewer_qq):
+            raise ValueError("只有总负责人或高级管理员可以登记志愿时长；普通管理员请不带小时数审核。")
         task = conn.execute(
             "SELECT id, deleted_at FROM tasks WHERE workspace=? AND id=?",
             (workspace, task_id),
@@ -920,6 +930,7 @@ def approve_submission(workspace: str, task_id: int, target_qq: str, reviewer_qq
             if not row:
                 return "not_claimed"
             return "not_submitted"
+        volunteer.on_approval(conn, workspace, task_id, target_qq, reviewer_qq, units)
         _sync_task_status(conn, task_id)
         return "ok"
 
@@ -1125,7 +1136,7 @@ def log_action(workspace: str, actor_qq: str, action: str, detail: str = "") -> 
         )
 
 
-def list_audit_logs(workspace: str, limit: int = 20):
+def list_audit_logs(workspace: str, limit: int = 20, include_volunteer: bool = True):
     limit = max(1, min(int(limit), 100))
     with connect() as conn:
         rows = conn.execute(
@@ -1133,10 +1144,10 @@ def list_audit_logs(workspace: str, limit: int = 20):
             SELECT l.*, COALESCE(u.name, l.actor_qq) AS actor_name
             FROM audit_logs l
             LEFT JOIN users u ON u.workspace=l.workspace AND u.qq=l.actor_qq
-            WHERE l.workspace=?
+            WHERE l.workspace=? AND (? OR (l.action NOT LIKE '%志愿时长%' AND l.action NOT LIKE '时长负责人%'))
             ORDER BY l.id DESC LIMIT ?
             """,
-            (workspace, limit),
+            (workspace, int(include_volunteer), limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1240,7 +1251,11 @@ def export_data(workspace: str):
             """,
             (workspace,),
         ).fetchall()]
-        return {"users": users, "tasks": tasks, "assignments": assignments, "audit_logs": logs}
+        requests = [dict(r) for r in conn.execute("SELECT * FROM task_requests WHERE workspace=? ORDER BY id", (workspace,))]
+        return {"users": users, "tasks": tasks, "assignments": assignments, "audit_logs": logs, "task_requests": requests,
+                "volunteer_entries": [dict(r) for r in conn.execute("SELECT * FROM volunteer_entries WHERE workspace=? ORDER BY id", (workspace,))],
+                "volunteer_managers": [dict(r) for r in conn.execute("SELECT * FROM volunteer_managers WHERE workspace=? ORDER BY qq", (workspace,))],
+                "volunteer_changes": [dict(r) for r in conn.execute("SELECT * FROM volunteer_changes WHERE workspace=? ORDER BY id", (workspace,))]}
 
 
 def create_daily_backup(keep: int = 30):
@@ -1265,3 +1280,118 @@ def create_daily_backup(keep: int = 30):
         except OSError:
             pass
     return target
+
+
+# Proposals become public tasks only after approval; no automatic assignment.
+def migrate_task_requests():
+    with connect() as conn:
+        if _table_exists(conn, "task_requests"):
+            return None
+        backup = _backup_before_migration(conn, "requests_v8")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""CREATE TABLE IF NOT EXISTS task_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL,
+            applicant_qq TEXT NOT NULL, task_type TEXT NOT NULL, subject TEXT NOT NULL,
+            required_knowledge TEXT NOT NULL,
+            required_people INTEGER NOT NULL CHECK(required_people >= 1), reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','withdrawn')),
+            created_at TEXT NOT NULL, reviewed_at TEXT, reviewer_qq TEXT,
+            review_comment TEXT NOT NULL DEFAULT '', task_id INTEGER UNIQUE REFERENCES tasks(id)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_workspace_status ON task_requests(workspace,status,id)")
+        return backup
+
+
+def validate_task_request_field(index, text):
+    text = str(text).strip()
+    if not text:
+        raise ValueError("内容不能为空，请重新输入；发送“取消”可退出。")
+    if index == 3:
+        try:
+            count = int(text)
+        except ValueError:
+            count = 0
+        if not 1 <= count <= 100:
+            raise ValueError("人数需求请输入 1 到 100 的整数。")
+        return str(count)
+    limit = (100, 100, 2000, 3, 1000)[index]
+    if len(text) > limit:
+        raise ValueError(f"这一项请控制在 {limit} 字以内。")
+    return text
+
+
+def create_task_request(workspace, qq, fields):
+    if len(fields) != 5:
+        raise ValueError("申请信息不完整。")
+    values = [validate_task_request_field(i, v) for i, v in enumerate(fields)]
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM users WHERE workspace=? AND qq=? AND active=1", (workspace,str(qq))).fetchone():
+            raise ValueError("当前成员资格无效，不能申请任务。")
+        cur = conn.execute("""INSERT INTO task_requests
+            (workspace,applicant_qq,task_type,subject,required_knowledge,required_people,reason,created_at)
+            VALUES(?,?,?,?,?,?,?,?)""", (workspace,str(qq),*values[:3],int(values[3]),values[4],now_text()))
+        rid = int(cur.lastrowid)
+        conn.execute("INSERT INTO audit_logs(workspace,actor_qq,action,detail,created_at) VALUES(?,?,?,?,?)",
+                     (workspace,str(qq),"申请发布任务",f"申请 #{rid}",now_text()))
+        return rid
+
+
+def get_task_request(workspace, request_id):
+    with connect() as conn:
+        row = conn.execute("""SELECT r.*, COALESCE(u.name,r.applicant_qq) AS applicant_name
+            FROM task_requests r LEFT JOIN users u ON u.workspace=r.workspace AND u.qq=r.applicant_qq
+            WHERE r.workspace=? AND r.id=?""", (workspace,request_id)).fetchone()
+        return dict(row) if row else None
+
+
+def list_task_requests(workspace, applicant_qq=None, pending_only=False, page=1):
+    where = "r.workspace=?"
+    args = [workspace]
+    if applicant_qq is not None:
+        where += " AND r.applicant_qq=?"
+        args.append(str(applicant_qq))
+    if pending_only:
+        where += " AND r.status='pending'"
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(f"""SELECT r.*, COALESCE(u.name,r.applicant_qq) AS applicant_name
+            FROM task_requests r LEFT JOIN users u ON u.workspace=r.workspace AND u.qq=r.applicant_qq
+            WHERE {where} ORDER BY r.id DESC LIMIT 10 OFFSET ?""", (*args,(max(1,page)-1)*10))]
+
+
+def decide_task_request(workspace, request_id, actor_qq, decision, comment=""):
+    if decision not in ("approved","rejected","withdrawn"):
+        raise ValueError("无效审批操作")
+    comment = comment.strip()
+    if decision == "rejected" and not comment:
+        return "reason_required", None
+    if len(comment) > 1000:
+        return "reason_too_long", None
+    # A single transaction serializes approvals/withdrawals and task creation.
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        actor = conn.execute("SELECT role FROM users WHERE workspace=? AND qq=? AND active=1", (workspace,str(actor_qq))).fetchone()
+        if not actor:
+            return "forbidden", None
+        row = conn.execute("SELECT * FROM task_requests WHERE workspace=? AND id=?", (workspace,request_id)).fetchone()
+        if not row:
+            return "not_found", None
+        allowed = row['applicant_qq'] == str(actor_qq) if decision == 'withdrawn' else (actor['role'] in ('owner','admin') or bool(conn.execute('SELECT 1 FROM volunteer_managers WHERE workspace=? AND qq=?',(workspace,str(actor_qq))).fetchone()))
+        if not allowed:
+            return "forbidden", None
+        if row['status'] != 'pending':
+            return "already_processed", row['task_id']
+        stamp = now_text()
+        task_id = None
+        if decision == 'approved':
+            cur = conn.execute("""INSERT INTO tasks
+                (workspace,task_type,subject,required_knowledge,publisher_qq,status,created_at,required_people,deleted_at)
+                VALUES(?,?,?,?,?,'open',?,?,NULL)""",
+                (workspace,row['task_type'],row['subject'],row['required_knowledge'],str(actor_qq),stamp,row['required_people']))
+            task_id = int(cur.lastrowid)
+        conn.execute("UPDATE task_requests SET status=?,reviewed_at=?,reviewer_qq=?,review_comment=?,task_id=? WHERE workspace=? AND id=?",
+                     (decision,stamp,str(actor_qq),comment,task_id,workspace,request_id))
+        action = {'approved':'批准任务申请','rejected':'驳回任务申请','withdrawn':'撤回任务申请'}[decision]
+        conn.execute("INSERT INTO audit_logs(workspace,actor_qq,action,detail,created_at) VALUES(?,?,?,?,?)",
+                     (workspace,str(actor_qq),action,f"申请 #{request_id}" + (f" → 任务 #{task_id}" if task_id else "") + (f"｜{comment}" if comment else ""),stamp))
+        return "ok", task_id
